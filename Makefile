@@ -1,13 +1,20 @@
 .PHONY: download-data preprocess-data train evaluate
 
+# Detect if we're on Windows and use appropriate Python command
+ifeq ($(OS),Windows_NT)
+	PYTHON = venv\Scripts\python.exe
+else
+	PYTHON = python3
+endif
+
 download-data:
-	python3 scripts/download_data.py
+	$(PYTHON) scripts/download_data.py
 
 preprocess-data:
-	python3 -m data.preprocess
+	$(PYTHON) -m data.preprocess
 
 train:
-	python3 -m training.train_dqn
+	$(PYTHON) -m training.train_dqn
 
 evaluate:
-	python3 -m evaluation.evaluate_dqn
+	$(PYTHON) -m evaluation.evaluate_dqn

@@ -83,22 +83,24 @@ def evaluate_ticker(model, ticker, max_steps=300, window_size=30):
     Returns:
         Dictionary with "dqn", "buy_hold", and "random" portfolio value arrays
     """
-    # Force env to load only this ticker
-    ticker_file = f"{ticker}.csv"
+    # Force env to load only this ticker (test mode)
+    ticker_file = f"{ticker}_test.csv"
     
     # ---- DQN ----
     env = TradingEnv(
         window_size=window_size,
         random_ticker=False,
-        tickers=[ticker_file]
+        tickers=[ticker_file],
+        mode="test"
     )
-    dqn_result = run_greedy_policy(env, model, max_steps=max_steps)
+    dqn_result = run_greedy_policy(env, model, max_steps=max_steps, verbose=True)
     
     # ---- Buy & Hold ----
     env_bh = TradingEnv(
         window_size=window_size,
         random_ticker=False,
-        tickers=[ticker_file]
+        tickers=[ticker_file],
+        mode="test"
     )
     bh_result = run_buy_and_hold(env_bh, max_steps=max_steps)
     
@@ -106,7 +108,8 @@ def evaluate_ticker(model, ticker, max_steps=300, window_size=30):
     env_rand = TradingEnv(
         window_size=window_size,
         random_ticker=False,
-        tickers=[ticker_file]
+        tickers=[ticker_file],
+        mode="test"
     )
     rand_result = run_random_policy(env_rand, max_steps=max_steps)
     
@@ -117,7 +120,7 @@ def evaluate_ticker(model, ticker, max_steps=300, window_size=30):
     }
 
 
-def load_trained_model(env, model_path="models/trained_dqn.pth", hidden_dim=64):
+def load_trained_model(env, model_path="models/trained_dqn.pth", hidden_dim=128):
     """
     Load a trained CNN DQN model from file.
     
@@ -142,7 +145,7 @@ def load_trained_model(env, model_path="models/trained_dqn.pth", hidden_dim=64):
     return model, window, num_features
 
 
-def run_greedy_policy(env, model, max_steps=1000):
+def run_greedy_policy(env, model, max_steps=1000, verbose=False):
     """
     Run the DQN model with greedy policy (epsilon=0, always argmax Q).
     
@@ -150,7 +153,8 @@ def run_greedy_policy(env, model, max_steps=1000):
         env: Trading environment instance
         model: Trained CNN DQN model
         max_steps: Maximum number of steps
-        
+        verbose: If True, print action statistics
+    
     Returns:
         Dictionary with portfolio_values, rewards, and steps
     """
@@ -159,6 +163,7 @@ def run_greedy_policy(env, model, max_steps=1000):
     done = False
     portfolio_values = []
     rewards = []
+    actions_taken = []
     step_count = 0
     
     while not done and step_count < max_steps:
@@ -166,6 +171,7 @@ def run_greedy_policy(env, model, max_steps=1000):
             state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
             q = model(state_tensor)
             action = q.argmax().item()
+            actions_taken.append(action)
         
         next_obs, reward, done, info = env.step(action)
         next_state = next_obs  # Keep as 2D (window, features)
@@ -176,10 +182,23 @@ def run_greedy_policy(env, model, max_steps=1000):
         state = next_state
         step_count += 1
     
+    # Print action statistics if verbose
+    if verbose and actions_taken:
+        action_counts = {}
+        action_names = {0: "Hold", 1: "Buy 25%", 2: "Buy 50%", 3: "Buy 100%", 
+                        4: "Sell 25%", 5: "Sell 50%", 6: "Sell 100%"}
+        for a in actions_taken:
+            action_counts[a] = action_counts.get(a, 0) + 1
+        print(f"\nAction distribution:")
+        for action_id, count in sorted(action_counts.items()):
+            pct = 100 * count / len(actions_taken)
+            print(f"  {action_names.get(action_id, f'Action {action_id}')}: {count} ({pct:.1f}%)")
+    
     return {
         "portfolio_values": np.array(portfolio_values),
         "rewards": np.array(rewards),
-        "steps": step_count
+        "steps": step_count,
+        "actions": actions_taken
     }
 
 
@@ -303,8 +322,8 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print("Loading trained model...")
-    # Initialize environment with deterministic settings for model loading
-    env = TradingEnv(window_size=30, random_ticker=False)
+    # Initialize environment with deterministic settings for model loading (test mode)
+    env = TradingEnv(window_size=30, random_ticker=False, mode="test")
     model, window, num_features = load_trained_model(env, model_path=str(model_path))
     print(f"Model loaded successfully (window={window}, num_features={num_features})")
     

@@ -1,0 +1,88 @@
+================================================================================
+MODEL SPECIFICATIONS - DQN Trading Agent
+================================================================================
+
+ARCHITECTURE:
+------------
+Type: Dueling Double DQN with CNN encoder
+- CNN Encoder: 3-layer 1D Convolutional Network
+  * Conv1d: num_features → 16 channels (kernel=3)
+  * Conv1d: 16 → 32 channels (kernel=3)
+  * Conv1d: 32 → 32 channels (kernel=3)
+  * All layers use ReLU activation
+
+- Dueling Architecture:
+  * Shared embedding: Linear(embedding_dim → 128) + ReLU
+  * Value head: Linear(128 → 1)
+  * Advantage head: Linear(128 → 7)
+  * Q-value: V(s) + (A(s,a) - mean(A(s,:)))
+
+- Hidden dimension: 128
+- Window size: 30 time steps
+- Number of features: 12 (11 technical indicators + position)
+- Output actions: 7 (Hold, Buy 25%, Buy 50%, Buy 100%, Sell 25%, Sell 50%, Sell 100%)
+
+TRAINING HYPERPARAMETERS:
+-------------------------
+Episodes: 1000
+Max steps per episode: 200
+Batch size: 1024
+Learning rate: 1e-4
+Optimizer: Adam
+Loss function: SmoothL1Loss (Huber Loss)
+Gamma (discount factor): 0.995
+
+Training frequency: TRAIN_EVERY = 1 (train every step)
+Gradient updates per step: 8
+Replay buffer warmup: 5000 transitions minimum
+Replay buffer capacity: 50,000 transitions
+Target network update interval: Every 500 episodes
+
+Epsilon-greedy exploration:
+- Start: 1.0 (100% random)
+- End: 0.1 (10% random)
+- Decay: Exponential with decay_steps = 10,000
+
+Gradient clipping: 1.0 (max norm)
+Mixed precision training: Enabled (CUDA AMP)
+
+ENVIRONMENT SETTINGS:
+---------------------
+Window size: 30 days
+Initial cash: $10,000
+Position range: [0.0, 1.0] (0 = 100% cash, 1 = 100% invested)
+Reward: Log-return scaled by 100.0
+  reward = 100.0 * (log(portfolio_after) - log(portfolio_before))
+
+Action space: 7 discrete actions
+- 0: Hold
+- 1: Increase position by 25%
+- 2: Increase position by 50%
+- 3: Increase position by 100% (go fully long)
+- 4: Decrease position by 25%
+- 5: Decrease position by 50%
+- 6: Decrease position by 100% (go fully cash)
+
+TRAINING FEATURES:
+------------------
+✓ Double DQN (policy net selects actions, target net evaluates)
+✓ Dueling DQN architecture (separate value/advantage heads)
+✓ Experience replay buffer
+✓ Target network with periodic updates
+✓ Gradient clipping for stability
+✓ Mixed precision training (CUDA AMP)
+✓ Reward scaling (×100)
+✓ Replay buffer warmup period
+
+DATA:
+-----
+Training: Multi-ticker (random selection per episode)
+Evaluation tickers: SPY.US, QQQ.US, AAPL.US, MSFT.US, TSLA.US, AMZN.US, NVDA.US
+Features: Technical indicators (RSI, MACD, Bollinger Bands, etc.) + position
+
+HARDWARE:
+---------
+GPU: NVIDIA GeForce RTX 3070 (CUDA enabled)
+PyTorch version: 2.6.0+cu124
+
+================================================================================

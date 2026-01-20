@@ -8,6 +8,9 @@ import numpy as np
 from pathlib import Path
 import random
 
+# Split date must match data/preprocess.py
+SPLIT_DATE = "2020-01-01"
+
 
 class TradingEnv:
     """
@@ -27,7 +30,8 @@ class TradingEnv:
     """
     
     def __init__(self, data_dir="data/processed", window_size=30, 
-                 initial_cash=10_000, tickers=None, random_ticker=True):
+                 initial_cash=10_000, tickers=None, random_ticker=True,
+                 start_index=None, end_index=None, mode="train"):
         """
         Initialize the trading environment.
         
@@ -35,11 +39,23 @@ class TradingEnv:
             data_dir: Folder with processed CSV files
             window_size: Number of past days in the observation window
             initial_cash: Starting cash amount
-            tickers: Optional list of ticker filenames (e.g., ["SPY.US.csv", ...]).
-                    If None, automatically detect all CSV files in data_dir.
+            tickers: Optional list of ticker filenames (e.g., ["SPY.US_train.csv", ...]).
+                    Must match the mode (include _train or _test suffix).
+                    If None, automatically loads all files matching the mode.
             random_ticker: If True, each episode picks a random ticker; 
                           otherwise always use the first.
+            start_index: Optional start index for evaluation (for no-leakage testing).
+                        If None, uses window_size.
+            end_index: Optional end index for evaluation (for no-leakage testing).
+                      If None, uses full dataset length.
+            mode: "train" or "test" - determines which CSV files to load
         """
+        # Validate mode
+        assert mode in ["train", "test"], f"mode must be 'train' or 'test', got '{mode}'"
+        self.mode = mode
+        
+        self.start_index = start_index
+        self.end_index = end_index
         self.data_dir = Path(data_dir)
         self.window_size = window_size
         self.initial_cash = initial_cash
@@ -62,12 +78,18 @@ class TradingEnv:
             6: ("decrease", 1.00),
         }
         
-        # Load available tickers
+        # Load available tickers based on mode
         if tickers is None:
             self._load_available_tickers()
         else:
+            # Validate that ticker filenames match the mode
+            suffix = f"_{mode}.csv"
+            for ticker_file in tickers:
+                assert ticker_file.endswith(suffix), \
+                    f"Ticker file '{ticker_file}' must end with '{suffix}' for mode '{mode}'"
             self.ticker_files = tickers
-            self.ticker_symbols = [f.replace('.csv', '') for f in tickers]
+            # Extract base ticker symbol (remove _train.csv or _test.csv)
+            self.ticker_symbols = [f.replace(f"_{mode}.csv", '') for f in tickers]
         
         # Episode state
         self.df = None
@@ -78,13 +100,15 @@ class TradingEnv:
         self.current_ticker = None
         
     def _load_available_tickers(self):
-        """Scan data_dir for all CSV files and store ticker information."""
-        csv_files = sorted(list(self.data_dir.glob("*.csv")))
+        """Scan data_dir for CSV files matching the mode and store ticker information."""
+        suffix = f"_{self.mode}.csv"
+        csv_files = sorted(list(self.data_dir.glob(f"*{suffix}")))
         self.ticker_files = [f.name for f in csv_files]
-        self.ticker_symbols = [f.stem for f in csv_files]
+        # Extract base ticker symbol (remove _train.csv or _test.csv)
+        self.ticker_symbols = [f.name.replace(suffix, '') for f in csv_files]
         
         if not self.ticker_files:
-            raise ValueError(f"No CSV files found in {self.data_dir}")
+            raise ValueError(f"No {self.mode} CSV files found in {self.data_dir}. Expected files ending with '{suffix}'")
     
     def reset(self, start_index=None):
         """
@@ -113,12 +137,25 @@ class TradingEnv:
         self.df['Date'] = pd.to_datetime(self.df['Date'])
         self.df = self.df.sort_values('Date').reset_index(drop=True)
         
+        # Assertions: verify dates are in correct range based on mode
+        split_date = pd.to_datetime(SPLIT_DATE)
+        if self.mode == "train":
+            # All dates must be strictly before SPLIT_DATE
+            max_date = self.df['Date'].max()
+            assert max_date < split_date, \
+                f"Train data for {ticker_file} contains dates >= {SPLIT_DATE}. Max date: {max_date.date()}"
+        else:  # mode == "test"
+            # All dates must be >= SPLIT_DATE
+            min_date = self.df['Date'].min()
+            assert min_date >= split_date, \
+                f"Test data for {ticker_file} contains dates < {SPLIT_DATE}. Min date: {min_date.date()}"
+        
         # Identify numeric feature columns (all except "Date")
         self.features = [col for col in self.df.columns if col != 'Date']
         
         # Initialize episode state
         if start_index is None:
-            start_index = self.window_size
+            start_index = self.start_index if self.start_index is not None else self.window_size
         self.current_step = start_index
         self.cash = self.initial_cash
         self.shares = 0.0
@@ -178,6 +215,19 @@ class TradingEnv:
         # Current price
         price_t = self.df["Close"].iloc[self.current_step]
         
+        # Safety check: ensure price is valid
+        if pd.isna(price_t) or price_t <= 0:
+            # Skip this step if price is invalid
+            self.current_step += 1
+            done = self.current_step >= len(self.df) - 1
+            obs = self._get_observation()
+            return obs, 0.0, done, {
+                "cash": self.cash,
+                "shares": self.shares,
+                "position": self.position,
+                "portfolio_value": self.cash + self.shares * (self.df["Close"].iloc[min(self.current_step, len(self.df)-1)] if not pd.isna(self.df["Close"].iloc[min(self.current_step, len(self.df)-1)]) else 0),
+            }
+        
         # Portfolio BEFORE price change
         portfolio_before = self.cash + self.shares * price_t
         
@@ -193,15 +243,17 @@ class TradingEnv:
         # Advance time
         self.current_step += 1
         
-        # Terminal check
-        done = self.current_step >= len(self.df) - 1
+        # Terminal check (respect end_index if set)
+        max_step = (self.end_index if self.end_index is not None else len(self.df)) - 1
+        done = self.current_step >= max_step
         
         # Price after move
         price_next = self.df["Close"].iloc[self.current_step]
         portfolio_after = self.cash + self.shares * price_next
         
-        # Log-return reward
+        # Log-return reward with scaling (helps network see signal)
         reward = np.log(portfolio_after + 1e-8) - np.log(portfolio_before + 1e-8)
+        reward *= 100.0  # Scale reward to make it more visible to the network
         
         # Build observation (window_size days + position)
         start = max(0, self.current_step - self.window_size + 1)

@@ -9,8 +9,8 @@ import torch.nn as nn
 
 class CNN_DQN(nn.Module):
     """
-    CNN-based Deep Q-Network model for trading agent.
-    Processes sequences using 1D convolutions.
+    CNN-based Deep Q-Network model for trading agent with Dueling architecture.
+    Processes sequences using 1D convolutions, then splits into value and advantage heads.
     
     Args:
         window_size: Length of the sequence window
@@ -35,13 +35,17 @@ class CNN_DQN(nn.Module):
         # Compute size after conv layers:
         # Each conv with kernel_size=3 reduces sequence length by 2
         conv_output_size = window_size - 2 - 2 - 2  # kernel_size=3 reduces 2 each conv
-        linear_input_dim = 32 * conv_output_size
+        embedding_dim = 32 * conv_output_size
         
-        self.fc = nn.Sequential(
-            nn.Linear(linear_input_dim, 64),
+        # Shared embedding layer
+        self.embedding = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(64, output_dim)
         )
+        
+        # Dueling architecture: separate value and advantage heads
+        self.value_head = nn.Linear(hidden_dim, 1)
+        self.advantage_head = nn.Linear(hidden_dim, output_dim)
     
     def forward(self, x):
         """
@@ -57,7 +61,18 @@ class CNN_DQN(nn.Module):
         x = x.permute(0, 2, 1)  # -> (batch, features, window)
         x = self.cnn(x)
         x = x.flatten(start_dim=1)
-        return self.fc(x)
+        
+        # Shared embedding
+        embedding = self.embedding(x)
+        
+        # Dueling heads
+        value = self.value_head(embedding)  # (batch, 1)
+        advantage = self.advantage_head(embedding)  # (batch, output_dim)
+        
+        # Combine: Q(s,a) = V(s) + (A(s,a) - mean(A(s,:)))
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        
+        return q_values
 
 
 def create_cnn_dqn(window_size, num_features, output_dim=7, hidden_dim=64):

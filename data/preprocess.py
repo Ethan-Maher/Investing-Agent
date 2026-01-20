@@ -1,13 +1,19 @@
 """
-Preprocess raw stock data: clean, add indicators, and normalize.
+Preprocess raw stock data: clean, add indicators, split into train/test, and normalize.
 """
 
+import json
 import pandas as pd
 from pathlib import Path
 
 from indicators.technical_indicators import (
     add_sma, add_ema, add_rsi, add_macd, add_all_indicators
 )
+
+# Global time-based split date
+SPLIT_DATE = "2020-01-01"
+# Epsilon for avoiding divide-by-zero in normalization
+EPSILON = 1e-8
 
 
 def get_tickers():
@@ -99,31 +105,54 @@ def clean_data(df):
     return df
 
 
-def normalize_data(df):
+def compute_scaler_params(train_df):
     """
-    Normalize numeric columns using min-max normalization.
-    
-    Formula: (x - x.min()) / (x.max() - x.min())
+    Compute min and max values from training data only.
     
     Args:
-        df: DataFrame with numeric columns to normalize
+        train_df: Training DataFrame
         
     Returns:
-        DataFrame with normalized numeric columns
+        Dictionary mapping column names to {'min': float, 'max': float}
+    """
+    # Identify numeric columns (exclude Date)
+    numeric_cols = train_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+    
+    scaler_params = {}
+    for col in numeric_cols:
+        col_min = float(train_df[col].min())
+        col_max = float(train_df[col].max())
+        scaler_params[col] = {'min': col_min, 'max': col_max}
+    
+    return scaler_params
+
+
+def normalize_with_scaler(df, scaler_params):
+    """
+    Normalize DataFrame using pre-computed min/max values.
+    
+    Formula: (x - min) / (max - min + epsilon)
+    
+    Args:
+        df: DataFrame to normalize
+        scaler_params: Dictionary mapping column names to {'min': float, 'max': float}
+        
+    Returns:
+        Normalized DataFrame
     """
     df = df.copy()
     
-    # Identify numeric columns (exclude Date)
-    numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-    
-    # Normalize each numeric column
-    for col in numeric_cols:
-        col_min = df[col].min()
-        col_max = df[col].max()
+    for col, params in scaler_params.items():
+        if col not in df.columns:
+            continue
         
-        # Avoid division by zero
-        if col_max - col_min != 0:
-            df[col] = (df[col] - col_min) / (col_max - col_min)
+        col_min = params['min']
+        col_max = params['max']
+        col_range = col_max - col_min
+        
+        # Normalize with epsilon to avoid divide-by-zero
+        if col_range > 0:
+            df[col] = (df[col] - col_min) / (col_range + EPSILON)
         else:
             # If all values are the same, set to 0
             df[col] = 0.0
@@ -131,9 +160,27 @@ def normalize_data(df):
     return df
 
 
+def save_scaler_params(ticker, scaler_params, scalers_dir):
+    """
+    Save scaler parameters to JSON file.
+    
+    Args:
+        ticker: Ticker symbol
+        scaler_params: Dictionary of scaler parameters
+        scalers_dir: Directory to save scaler files
+    """
+    scalers_dir_path = Path(scalers_dir)
+    scalers_dir_path.mkdir(parents=True, exist_ok=True)
+    
+    scaler_path = scalers_dir_path / f"{ticker}_scaler.json"
+    
+    with open(scaler_path, 'w') as f:
+        json.dump(scaler_params, f, indent=2)
+
+
 def process_ticker(ticker, raw_dir, processed_dir):
     """
-    Process a single ticker: load, clean, add indicators, normalize, and save.
+    Process a single ticker: load, clean, add indicators, split by date, and save.
     
     Args:
         ticker: Ticker symbol
@@ -141,14 +188,14 @@ def process_ticker(ticker, raw_dir, processed_dir):
         processed_dir: Path to processed data directory
         
     Returns:
-        Number of rows in processed data, or None if failed
+        Tuple of (train_rows, test_rows) or None if failed
     """
     # Load raw data
     df = load_raw_data(ticker, raw_dir)
     if df is None:
         return None
     
-    # Clean the data
+    # Clean the data (sorts by date)
     df = clean_data(df)
     
     if df.empty:
@@ -163,19 +210,45 @@ def process_ticker(ticker, raw_dir, processed_dir):
     if df.empty:
         return None
     
-    # Normalize numeric columns
-    df = normalize_data(df)
+    # Ensure Date is datetime for comparison
+    df['Date'] = pd.to_datetime(df['Date'])
     
-    # Save to processed directory
-    processed_path = Path(processed_dir) / f"{ticker}.csv"
-    processed_path.parent.mkdir(parents=True, exist_ok=True)
+    # Split into train and test based on SPLIT_DATE
+    split_date = pd.to_datetime(SPLIT_DATE)
+    train_df = df[df['Date'] < split_date].copy()
+    test_df = df[df['Date'] >= split_date].copy()
+    
+    # Assertions: both splits must be non-empty
+    assert not train_df.empty, f"Train split is empty for {ticker}. Need data before {SPLIT_DATE}."
+    assert not test_df.empty, f"Test split is empty for {ticker}. Need data on or after {SPLIT_DATE}."
+    
+    # Compute normalization parameters from TRAIN data only
+    scaler_params = compute_scaler_params(train_df)
+    
+    # Normalize both train and test using train statistics
+    train_df_normalized = normalize_with_scaler(train_df, scaler_params)
+    test_df_normalized = normalize_with_scaler(test_df, scaler_params)
+    
+    # Create processed directory
+    processed_dir_path = Path(processed_dir)
+    processed_dir_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save scaler parameters
+    scalers_dir = processed_dir_path / "scalers"
+    save_scaler_params(ticker, scaler_params, scalers_dir)
     
     # Convert Date back to string format for CSV
-    df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+    train_df_normalized['Date'] = train_df_normalized['Date'].dt.strftime('%Y-%m-%d')
+    test_df_normalized['Date'] = test_df_normalized['Date'].dt.strftime('%Y-%m-%d')
     
-    df.to_csv(processed_path, index=False)
+    # Save train and test splits as separate CSVs
+    train_path = processed_dir_path / f"{ticker}_train.csv"
+    test_path = processed_dir_path / f"{ticker}_test.csv"
     
-    return len(df)
+    train_df_normalized.to_csv(train_path, index=False)
+    test_df_normalized.to_csv(test_path, index=False)
+    
+    return (len(train_df_normalized), len(test_df_normalized))
 
 
 def process_all():
@@ -185,11 +258,15 @@ def process_all():
     
     tickers = get_tickers()
     
+    print(f"Splitting data at {SPLIT_DATE}")
+    print("=" * 60)
+    
     for ticker in tickers:
-        rows = process_ticker(ticker, raw_dir, processed_dir)
+        result = process_ticker(ticker, raw_dir, processed_dir)
         
-        if rows is not None:
-            print(f"Processed {ticker} → {rows} rows")
+        if result is not None:
+            train_rows, test_rows = result
+            print(f"Processed {ticker} - Train: {train_rows} rows, Test: {test_rows} rows")
         else:
             print(f"Failed to process {ticker}")
 

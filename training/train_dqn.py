@@ -50,9 +50,9 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    # For deterministic behavior (may reduce performance)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Enable cuDNN benchmark for better GPU performance (disable for reproducibility)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 # Set seed for reproducibility
@@ -110,20 +110,22 @@ def init_metrics_file(path):
 def train_dqn():
     """Main training function."""
     # Training parameters
-    TRAIN_EVERY = 10  # update network once every 10 steps
-    episodes = 3000
+    TRAIN_EVERY = 1  # update network every step
+    GRAD_UPDATES_PER_STEP = 8  # do 8 minibatch updates each time we train
+    WARMUP = 5000  # minimum transitions before training starts
+    episodes = 1000
     max_steps_per_episode = 200
-    batch_size = 64
-    gamma = 0.99
-    lr = 5e-5
+    batch_size = 1024  # GPU-heavy batch size (try 2048 if memory allows)
+    gamma = 0.995
+    lr = 1e-4  # start with 1e-4, reduce to 5e-5 if unstable
     epsilon_start = 1.0
     epsilon_end = 0.1
     epsilon_decay = 10000  # decay measured in training steps, not episodes
     target_update_interval = 500
     replay_capacity = 50_000
     
-    # Initialize environment
-    env = TradingEnv(window_size=30)
+    # Initialize environment in train mode
+    env = TradingEnv(window_size=30, mode="train")
     
     # Determine state shape (keep as 2D)
     sample_obs = env.reset()
@@ -146,8 +148,12 @@ def train_dqn():
     # Replay buffer
     replay = ReplayBuffer(replay_capacity)
     
-    # Loss function
-    criterion = nn.MSELoss()
+    # Loss function: Huber loss (SmoothL1Loss) for better stability
+    criterion = nn.SmoothL1Loss()
+    
+    # Mixed precision training (AMP) for CUDA
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
     # Setup metrics logging
     results_dir = Path("results")
@@ -184,34 +190,66 @@ def train_dqn():
             step_count += 1
             global_step += 1
             
-            # Train if we have enough samples and on schedule
-            if global_step % TRAIN_EVERY == 0 and len(replay) > batch_size:
-                # Sample batch
-                states, actions, rewards, next_states, dones = replay.sample(batch_size)
+            # Train if we have enough samples and on schedule (after warmup)
+            if (global_step % TRAIN_EVERY == 0 and 
+                len(replay) >= WARMUP and 
+                len(replay) > batch_size):
                 
-                # Convert to tensors - states are 2D (batch, window, features)
-                states_tensor = torch.tensor(states, dtype=torch.float32, device=device)
-                actions_tensor = torch.tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
-                next_states_tensor = torch.tensor(next_states, dtype=torch.float32, device=device)
-                dones_tensor = torch.tensor(dones, dtype=torch.float32, device=device)
-                
-                # Compute Q-values for current states
-                q_values = policy_net(states_tensor)
-                q_action = q_values.gather(1, actions_tensor)
-                
-                # Compute expected Q-values using target network
-                with torch.no_grad():
-                    next_q = target_net(next_states_tensor).max(1)[0]
-                    expected_q = rewards_tensor + gamma * next_q * (1 - dones_tensor)
-                
-                # Compute loss
-                loss = criterion(q_action.squeeze(), expected_q)
-                
-                # Optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                # Multiple gradient updates per step for better learning
+                for _ in range(GRAD_UPDATES_PER_STEP):
+                    # Sample batch
+                    states, actions, rewards, next_states, dones = replay.sample(batch_size)
+                    
+                    # Convert to tensors - keep all on CUDA device
+                    states_tensor = torch.tensor(states, dtype=torch.float32, device=device)
+                    actions_tensor = torch.tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
+                    rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+                    next_states_tensor = torch.tensor(next_states, dtype=torch.float32, device=device)
+                    dones_tensor = torch.tensor(dones, dtype=torch.float32, device=device)
+                    
+                    # Use mixed precision if available
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            # Compute Q-values for current states
+                            q_values = policy_net(states_tensor)
+                            q_action = q_values.gather(1, actions_tensor)
+                            
+                            # Double DQN: use policy net to select actions, target net to evaluate
+                            with torch.no_grad():
+                                next_actions = policy_net(next_states_tensor).argmax(dim=1)
+                                next_q = target_net(next_states_tensor).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                                expected_q = rewards_tensor + gamma * next_q * (1 - dones_tensor)
+                            
+                            # Compute loss
+                            loss = criterion(q_action.squeeze(), expected_q)
+                        
+                        # Optimize with gradient scaling
+                        optimizer.zero_grad()
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # Standard precision training
+                        # Compute Q-values for current states
+                        q_values = policy_net(states_tensor)
+                        q_action = q_values.gather(1, actions_tensor)
+                        
+                        # Double DQN: use policy net to select actions, target net to evaluate
+                        with torch.no_grad():
+                            next_actions = policy_net(next_states_tensor).argmax(dim=1)
+                            next_q = target_net(next_states_tensor).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                            expected_q = rewards_tensor + gamma * next_q * (1 - dones_tensor)
+                        
+                        # Compute loss
+                        loss = criterion(q_action.squeeze(), expected_q)
+                        
+                        # Optimize with gradient clipping
+                        optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+                        optimizer.step()
             
             # Decay epsilon based on global step
             epsilon = epsilon_end + (epsilon_start - epsilon_end) * np.exp(-global_step / epsilon_decay)
@@ -235,12 +273,13 @@ def train_dqn():
         avg_reward = np.mean(recent_rewards) if recent_rewards else total_reward
         
         # Print progress
-        print(f'Episode {episode} - Reward: {total_reward:.2f}, Avg (last 10): {avg_reward:.2f}, Epsilon: {epsilon:.3f}, Steps: {step_count}, Portfolio: {info["portfolio_value"]:.2f}')
+        warmup_status = f" (Warming up: {len(replay)}/{WARMUP})" if len(replay) < WARMUP else ""
+        print(f'Episode {episode} - Reward: {total_reward:.2f}, Avg (last 10): {avg_reward:.2f}, Epsilon: {epsilon:.3f}, Steps: {step_count}, Portfolio: {info["portfolio_value"]:.2f}, Replay: {len(replay)}{warmup_status}')
     
     # Save model
     model_dir = Path("models")
     model_dir.mkdir(exist_ok=True)
-    model_path = model_dir / "trained_dqn.pth"
+    model_path = model_dir / "trained_dqn_noleak.pth"
     torch.save(policy_net.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
