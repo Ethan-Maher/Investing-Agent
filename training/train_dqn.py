@@ -279,7 +279,7 @@ def train_dqn():
     # Save model
     model_dir = Path("models")
     model_dir.mkdir(exist_ok=True)
-    model_path = model_dir / "trained_dqn_noleak.pth"
+    model_path = model_dir / "trained_dqn_demo.pth"
     torch.save(policy_net.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
